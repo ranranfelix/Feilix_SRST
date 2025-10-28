@@ -1,0 +1,12 @@
+# 排除大文件和数据
+*.zip
+*.rar
+*.mp4
+*.psd
+*.exe
+*.dll
+data/
+dataset/
+models/
+__pycache__/
+*.pyc
