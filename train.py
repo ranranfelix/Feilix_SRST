@@ -860,25 +860,59 @@ class SimpleCNNBiLSTM(nn.Module):
 
 
 if __name__ == '__main__':
+    import datetime
     from decode.utils import param_io
-
+    import decode.utils.calibration_io
+    
+    print("="*80)
+    print("🔬 双螺旋PSF训练脚本")
+    print(f"⏰ 开始时间: {datetime.datetime.now()}")
+    print("="*80)
+    
+    # ========== 第1步：加载参数 ==========
     param_file = 'network/experiment1/param_run.yaml'
+    print(f"\n[1/7] 加载参数: {param_file}")
     param = param_io.load_params(param_file)
     param.Meta.version = decode.utils.bookkeeping.decode_state()
-    param = decode.utils.param_io.autoset_scaling(param)
-
-    # @markdown > Set the path to the calibration file
-    calibration_file = 'psfmod/spline_calibration_3dcal.mat'  # @param {type:"string"}
+    
+    # ========== 第2步：- 先设置PSF类型 ==========
+    print(f"\n[2/7] 配置双螺旋PSF")
+    calibration_file = "D:/Projects/train/psfmod/spline_calibration_3d_dh_3dcal.mat"
     param.InOut.calibration_file = calibration_file
-
-    # @markdown > Set the output directory(!), i.e. the folder in which you'll find the model during/after training. You may want to change this to a folder in your Google Drive, e.g. `gdrive/My Drive/[your_folder]`
-    model_dir = 'network/experiment1'  # @param {type:"string"}
-
-    # @markdown > Set the directory in which the checkpoints should be saved. This is useful if colab times out or crashes and you want to continue training. Unless you have reasons, you should use the same directory as for the model.
-    ckpt_dir = 'network/experiment1'  # @param {type:"string"}
+    
+    # 显式设置PSF类型（原来缺少这个！）
+    param.Simulation.psf_type = decode.utils.calibration_io.SMAPSplineCoefficient(
+        calib_file=calibration_file
+    )
+    print(f"  ✓ PSF类型: {type(param.Simulation.psf_type).__name__}")
+    print(f"  ✓ PSF文件: {calibration_file}")
+    
+    # ========== 第3步：现在才执行autoset_scaling（基于正确的PSF）==========
+    print(f"\n[3/7] 重新计算scaling参数（基于双螺旋PSF）")
+    param = decode.utils.param_io.autoset_scaling(param)
+    print(f"  ✓ z_max: {param.Scaling.z_max}")
+    print(f"  ✓ phot_max: {param.Scaling.phot_max}")
+    print(f"  ✓ input_scale: {param.Scaling.input_scale}")
+    
+    # ========== 第4步：降低参数防止GPU OOM ==========
+    print(f"\n[4/7] 优化训练参数（防止OOM）")
+    
+    # 关键修改：降低这些参数
+    param.HyperParameter.batch_size = 4  # 从24降到4
+    param.HyperParameter.channels_in = 5
+    param.Simulation.emitter_av = 12  # 从15降到12
+    
+    print(f"  ✓ Batch size: {param.HyperParameter.batch_size} (原24，降低防OOM)")
+    print(f"  ✓ 图像尺寸: {param.Simulation.img_size} (保持不变)")
+    print(f"  ✓ 平均发射体: {param.Simulation.emitter_av} (原15)")
+    
+    # ========== 第5步：设置输出路径（带时间戳避免覆盖）==========
+    print(f"\n[5/7] 配置输出路径")
+    model_dir = 'network/experiment1'
+    ckpt_dir = 'network/experiment1'
     from_ckpt = False
     model_dir = Path(model_dir)
-
+    
     if not model_dir.parents[0].is_dir():
         raise FileNotFoundError(
             f"The path to the directory of 'model_out' (and even its parent folder) could not be found.")
@@ -886,25 +920,62 @@ if __name__ == '__main__':
         if not model_dir.is_dir():
             model_dir.mkdir()
             print(f"Created directory, absolute path: {model_dir.resolve()}")
-
-    model_out = Path(model_dir) / 'model.pt'
-    ckpt_path = Path(ckpt_dir) / 'ckpt.pt'
-
+    
+    # 使用带日期的文件名
+    date_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    model_out = Path(model_dir) / f'model_dh_{date_str}.pt'
+    ckpt_path = Path(ckpt_dir) / f'ckpt_dh_{date_str}.pt'
+    
     param.InOut.experiment_out = str(model_dir)
-    param.HyperParameter.batch_size = 24
-    param.HyperParameter.channels_in = 5
-    # param.HyperParameter.epochs = 10  # ← 【新增】限定10个epoch进行对比实验
-    # param.Simulation.lifetime_avg = 5
-    param_run_path = Path(model_out).parents[0] / 'param_run.yaml'
+    
+    # 保存参数到带时间戳的文件
+    param_run_path = Path(model_out).parents[0] / f'param_dh_{date_str}.yaml'
     param_io.save_params(param_run_path, param)
+    
+    print(f"  ✓ 模型将保存: {model_out}")
+    print(f"  ✓ Checkpoint: {ckpt_path}")
+    print(f"  ✓ 参数已保存: {param_run_path}")
+    
+    # ========== 第6步：GPU检查 ==========
+    print(f"\n[6/7] GPU状态检查")
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("❌ GPU不可用")
+    
+    torch.cuda.empty_cache()
+    gpu_props = torch.cuda.get_device_properties(0)
+    total_mem = gpu_props.total_memory / (1024**3)
+    used_mem = torch.cuda.memory_allocated(0) / (1024**3)
+    
+    print(f"  ✓ GPU: {gpu_props.name}")
+    print(f"  ✓ 总内存: {total_mem:.2f} GB")
+    print(f"  ✓ 已使用: {used_mem:.2f} GB")
+    print(f"  ✓ 可用: {total_mem - used_mem:.2f} GB")
+    
+    if total_mem < 6:
+        print(f"  ⚠️ 警告：GPU内存较小，自动降低batch_size到2")
+        param.HyperParameter.batch_size = 2
+    
+    # ========== 第7步：设置模拟器 ==========
+    print(f"\n[7/7] 初始化模拟器")
     import generic.random_simulation
-
-    sim_train, sim_test = generic.random_simulation.setup_random_simulation(param)
-    # sim_train, sim_test = decode.neuralfitter.train.live_engine.setup_random_simulation(param)
+    
+    try:
+        sim_train, sim_test = generic.random_simulation.setup_random_simulation(param)
+        print(f"  ✓ 模拟器设置完成")
+    except Exception as e:
+        print(f"  ❌ 模拟器设置失败: {e}")
+        raise
+    
+    # ========== 开始训练设置 ==========
+    print("\n" + "="*80)
+    print("🚀 开始训练设置")
+    print("="*80)
+    
     simulator = sim_train
     from decode.neuralfitter.train import live_engine
     from decode.neuralfitter.utils import logger as logger_utils
-
+    
     device = 'cuda'
     logger = [logger_utils.SummaryWriter(log_dir='logs',
                                          filter_keys=["dx_red_mu", "dx_red_sig",
@@ -915,15 +986,16 @@ if __name__ == '__main__':
                                                       ]),
               logger_utils.DictLogger()]
     logger = logger_utils.MultiLogger(logger)
+    
     ds_train, ds_test, model, model_ls, grad_mod, post_processor, matcher, ckpt = \
         setup_trainer(sim_train, sim_test, logger, model_out, ckpt_path, device, param)
+    
     dl_train, dl_test = live_engine.setup_dataloader(param, ds_train, ds_test)
-
+    
     import Choose_Device as Device
     import Net.CNNLSTM as LS
-
-    # model = IST(1, seq_len=param.HyperParameter.channels_in, initial_features=32, sigma_eps_default=0.2, model_dim=32, num_heads=4, depth=3).to(Device.device)
-    # 替换原来的SimpleCNNBiLSTM
+    
+    # 替换为你的自定义模型
     model = AdaptiveCNNBiLSTM(
         in_channels=1, 
         out_channels=11, 
@@ -933,17 +1005,18 @@ if __name__ == '__main__':
         initial_features=48,
         sigma_eps_default=0.005,
         dropout_config={
-            'spatial_dropout': True,   # 使用空间dropout
-            'bottleneck_p': 0.3,       # 瓶颈层dropout
-            'lstm_p': 0.25,            # LSTM输出dropout  
-            'output_p': 0.15,          # 最终输出dropout
-            'adaptive': True           # 启用自适应dropout
+            'spatial_dropout': True,
+            'bottleneck_p': 0.3,
+            'lstm_p': 0.25,  
+            'output_p': 0.15,
+            'adaptive': True
         }
     ).to(Device.device)
-
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0006, weight_decay=0.1)
-    psf = decode.utils.calibration_io.SMAPSplineCoefficient(
-        calib_file=param.InOut.calibration_file).init_spline(
+    
+    # ✨ 重要：使用param中已经设置好的PSF对象
+    psf = param.Simulation.psf_type.init_spline(
         xextent=param.Simulation.psf_extent[0],
         yextent=param.Simulation.psf_extent[1],
         img_shape=param.Simulation.img_size,
@@ -951,6 +1024,7 @@ if __name__ == '__main__':
         roi_size=param.Simulation.roi_size,
         roi_auto_center=param.Simulation.roi_auto_center
     )
+    
     criterion = LossFunc(
         xextent=param.Simulation.psf_extent[0],
         yextent=param.Simulation.psf_extent[1],
@@ -958,20 +1032,13 @@ if __name__ == '__main__':
         psf=psf,
         device=param.Hardware.device_simulation,
     )
-    # criterion = decode.neuralfitter.loss.GaussianMMLoss(
-    #     xextent=param.Simulation.psf_extent[0],
-    #     yextent=param.Simulation.psf_extent[1],
-    #     img_shape=param.Simulation.img_size,
-    #     device=param.Hardware.device_simulation,
-    #     chweight_stat=param.HyperParameter.chweight_stat
-    # )
-
+    
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, gamma=0.9, step_size=10)
-    # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,cooldown=10,factor=0.5,mode='min',patience=20,threshold=0.0001,verbose=True)
-
+    
     converges = False
     n = 0
     n_max = param.HyperParameter.auto_restart_param.num_restarts
+    
     if from_ckpt:
         ckpt = decode.utils.checkpoint.CheckPoint.load(param.InOut.checkpoint_init)
         model.load_state_dict(ckpt.model_state)
@@ -984,16 +1051,16 @@ if __name__ == '__main__':
         epoch0 = 0
         while not converges and n < n_max:
             n += 1
-
+            
             conv_check = decode.neuralfitter.utils.progress.GMMHeuristicCheck(
                 ref_epoch=1,
                 emitter_avg=sim_train.em_sampler.em_avg,
                 threshold=param.HyperParameter.auto_restart_param.restart_treshold,
             )
-
-        # 初始化科学监控器
+            
+            # 初始化科学监控器
             monitor = OverfittingMonitor(
-                patience=param.HyperParameter.epochs,  # 👈 设置为总epoch数
+                patience=param.HyperParameter.epochs,
                 min_epochs=5
             )
             
@@ -1005,46 +1072,10 @@ if __name__ == '__main__':
             print(f"Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
             print(f"Early Stopping Patience: {monitor.patience}")
             print("="*80 + "\n")
-
-            # # 👇 诊断代码 - 注意缩进要和上面的print对齐
-            # print("\n" + "="*80)
-            # print("🔍 训练前诊断")
-            # print("="*80)
             
-            # # 检查初始损失
-            # with torch.no_grad():
-            #     model.eval()
-            #     sample_batch = next(iter(dl_train))
-            #     x_sample = sample_batch[0].to(Device.device)
-            #     y_sample = sample_batch[1].to(Device.device)
-            #     y_pred = model(x_sample)
-            #     initial_loss = criterion(y_pred, y_sample, weight=None)
-                
-            #     print(f"随机初始化的损失: {initial_loss.item():.6f}")
-            
-            # # 检查数据范围
-            # print(f"输入数据范围: [{x_sample.min():.4f}, {x_sample.max():.4f}]")
-            # print(f"标签数据范围: [{y_sample.min():.4f}, {y_sample.max():.4f}]")
-            
-            # # 检查梯度
-            # model.train()
-            # optimizer.zero_grad()
-            # loss = criterion(y_pred, y_sample, weight=None)
-            # loss.backward()
-            # total_norm = 0
-            # for p in model.parameters():
-            #     if p.grad is not None:
-            #         param_norm = p.grad.data.norm(2)
-            #         total_norm += param_norm.item() ** 2
-            # total_norm = total_norm ** 0.5
-            # print(f"梯度范数: {total_norm:.6f}")
-            # print("="*80 + "\n")
-        
-
             for i in range(epoch0, param.HyperParameter.epochs):
                 logger.add_scalar('learning/learning_rate', optimizer.param_groups[0]['lr'], i)
-
-                # 👇 每个epoch都正常训练，删除了 if i >= 1 的判断
+                
                 train_loss = train(
                     model=model,
                     optimizer=optimizer,
@@ -1056,7 +1087,7 @@ if __name__ == '__main__':
                     device=torch.device(param.Hardware.device),
                     logger=logger
                 )
-
+                
                 val_loss, test_out = test_simple(
                     model=model, 
                     loss=criterion, 
@@ -1064,8 +1095,7 @@ if __name__ == '__main__':
                     epoch=i,
                     device=torch.device(param.Hardware.device)
                 )
-
-                # 👇 正常更新监控器，不需要判断 train_loss > 0
+                
                 monitor.update(train_loss, val_loss)
                 status, metrics = monitor.get_status(i)
                 
@@ -1087,7 +1117,7 @@ if __name__ == '__main__':
                 logger.add_scalar('monitor/relative_gap', metrics['relative_gap'], i)
                 logger.add_scalar('monitor/val_trend', metrics['val_trend'], i)
                 logger.add_scalar('monitor/gap_trend', metrics['gap_trend'], i)
-
+                
                 """Post-Process and Evaluate"""
                 decode.neuralfitter.train.live_engine.log_train_val_progress.post_process_log_test(
                     loss_cmp=test_out.loss,
@@ -1104,26 +1134,25 @@ if __name__ == '__main__':
                     logger=logger,
                     step=i
                 )
-
-                # 👇 学习率调整也不需要 if i >= 1 判断了
+                
                 if isinstance(lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     lr_scheduler.step(val_loss)
                 else:
                     lr_scheduler.step()
-
+                
                 model_ls.save(model, None)
                 ckpt.dump(model.state_dict(), optimizer.state_dict(), lr_scheduler.state_dict(),
                         log=logger.logger[1].log_dict, step=i)
-
-                # 👇 Early Stopping 检查（也删除了判断）
+                
+                # Early Stopping 检查
                 if monitor.should_stop(i):
                     print("\n" + "="*80)
                     print("🛑 Early Stopping Triggered")
                     print(f"验证损失已 {monitor.patience} 轮未改善，提前停止训练")
                     print("="*80 + "\n")
                     break
-
-                """Draw new samples Samples"""
+                
+                """Draw new samples"""
                 if param.Simulation.mode in 'acquisition':
                     del ds_train._frames
                     del ds_train._emitter
@@ -1133,11 +1162,11 @@ if __name__ == '__main__':
                 elif param.Simulation.mode != 'samples':
                     raise ValueError
         
-        # ===== for循环结束，训练总结开始 =====
+            # ===== 训练总结 =====
             print("\n" + "="*80)
             print("🎓 训练完成 - 科学评估报告")
             print("="*80)
-
+            
             summary = monitor.get_summary()
             if summary:
                 print(f"\n📊 统计指标:")
@@ -1172,24 +1201,28 @@ if __name__ == '__main__':
                 
                 # 保存详细结果
                 import json
-            comparison_results = {
-                'train_losses': [float(l) for l in monitor.train_losses],
-                'val_losses': [float(l) for l in monitor.val_losses],
-                'relative_gaps': [float(g) for g in monitor.relative_gaps],
-                'summary': convert_to_serializable(summary)  # 👈 修改这里
-            }
-            
-            result_file = model_dir / 'scientific_training_report.json'
-            with open(result_file, 'w') as f:
-                json.dump(comparison_results, f, indent=2)
-            
-            print(f"💾 详细报告已保存: {result_file}\n")
-            
-            break  # 你原来的 while 循环的 break
+                comparison_results = {
+                    'train_losses': [float(l) for l in monitor.train_losses],
+                    'val_losses': [float(l) for l in monitor.val_losses],
+                    'relative_gaps': [float(g) for g in monitor.relative_gaps],
+                    'summary': convert_to_serializable(summary)
+                }
+                
+                result_file = model_dir / 'scientific_training_report.json'
+                with open(result_file, 'w') as f:
+                    json.dump(comparison_results, f, indent=2)
+                
+                print(f"💾 详细报告已保存: {result_file}\n")
+                
+            break
     
     converges = True
     if converges:
-        print("Training finished after reaching maximum number of epochs.")
+        print("\n" + "="*80)
+        print("✅ 训练完成！")
+        print(f"⏰ 完成时间: {datetime.datetime.now()}")
+        print(f"📦 模型已保存: {model_out}")
+        print("="*80)
     else:
         raise ValueError(f"Training aborted after {n_max} restarts. "
                          "You can try to reduce the learning rate by a factor of 2."
